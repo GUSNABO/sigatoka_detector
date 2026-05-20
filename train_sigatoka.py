@@ -1,257 +1,229 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torchvision import datasets, transforms, models
-from torch.utils.data import DataLoader, random_split, Subset
 import os
+import numpy as np
+import torch
+import torch.nn.functional as F
+from torchvision import datasets, transforms, models
+from torch.utils.data import DataLoader, Subset
+from sklearn.model_selection import train_test_split
+from sklearn.svm import SVC
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, confusion_matrix, f1_score, recall_score
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import confusion_matrix
+import joblib
+
+# ==========================================
+# BLOQUE 0: Utilidades para OOD (Fuera de Dominio)
+# ==========================================
+def l2_normalize(arr, axis=1, eps=1e-12):
+    norm = np.linalg.norm(arr, axis=axis, keepdims=True)
+    return arr / (norm + eps)
+
+
+def compute_class_centroids(features, labels, num_classes):
+    centroids = []
+    for cls in range(num_classes):
+        cls_features = features[labels == cls]
+        if cls_features.size == 0:
+            centroids.append(np.zeros(features.shape[1], dtype=np.float32))
+        else:
+            centroids.append(cls_features.mean(axis=0))
+    return np.vstack(centroids)
+
+
+def compute_ood_threshold(val_features, val_labels, centroids, percentile=5):
+    if val_features.size == 0:
+        return 0.0
+    feats_norm = l2_normalize(val_features, axis=1)
+    cent_norm = l2_normalize(centroids, axis=1)
+    true_centroids = cent_norm[val_labels]
+    similarities = np.sum(feats_norm * true_centroids, axis=1)
+    return float(np.percentile(similarities, percentile))
 
 # ==========================================
 # BLOQUE 1: Configuración y Preprocesamiento
 # ==========================================
-def create_dataloaders(data_dir, batch_size=32):
+def create_datasets(data_dir, val_size=0.15, test_size=0.15, seed=42):
     """
-    Configura las transformaciones y carga el dataset usando ImageFolder.
-    Divide los datos en 80% entrenamiento y 20% validación.
-    Aplica Data Augmentation de forma exclusiva al conjunto de entrenamiento.
+    Crea splits estratificados (train/val/test) y aplica transformaciones diferenciadas.
     """
-    # Transformaciones avanzadas para Entrenamiento (Data Augmentation)
-    train_transforms = transforms.Compose([
-        transforms.Resize((227, 227)),
-        # Variación de color para que la red no se confunda con la luz (Fase Media)
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-        # Rotación y flip para que la red aprenda la forma en cualquier ángulo
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(15),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
-    # Transformaciones básicas para Validación (Sin alteración aleatoria)
-    val_transforms = transforms.Compose([
-        transforms.Resize((227, 227)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-
-    # Carga del dataset (espera carpetas: 0_Sano, 1_Fase_Inicial, 2_Fase_Media, 3_Fase_Final)
     try:
-        # Se instancian dos dataset para aplicar diferentes transformaciones sin conflictos
-        full_dataset_train = datasets.ImageFolder(root=data_dir, transform=train_transforms)
-        full_dataset_val = datasets.ImageFolder(root=data_dir, transform=val_transforms)
+        base_dataset = datasets.ImageFolder(root=data_dir)
     except FileNotFoundError:
         print(f"Error: No se encontró el dataset en {data_dir}. Asegúrese de crear las carpetas requeridas.")
-        return None, None, []
-        
-    # Separación 80% Train, 20% Val con semilla fija para reproducibilidad
-    dataset_size = len(full_dataset_train)
-    train_size = int(0.8 * dataset_size)
-    val_size = dataset_size - train_size
-    
-    # Generamos índices consistentes
-    generator = torch.Generator().manual_seed(42)
-    indices = torch.randperm(dataset_size, generator=generator).tolist()
-    
-    # Asignamos los subconjuntos asegurando que Validación no tenga Data Augmentation
-    train_dataset = Subset(full_dataset_train, indices[:train_size])
-    val_dataset = Subset(full_dataset_val, indices[train_size:])
+        return None, None, None, []
 
+    class_names = base_dataset.classes
+    targets = np.array(base_dataset.targets)
+    indices = np.arange(len(targets))
+
+    temp_size = val_size + test_size
+    train_idx, temp_idx, _, temp_y = train_test_split(
+        indices,
+        targets,
+        test_size=temp_size,
+        stratify=targets,
+        random_state=seed
+    )
+
+    test_ratio = test_size / temp_size
+    val_idx, test_idx = train_test_split(
+        temp_idx,
+        test_size=test_ratio,
+        stratify=temp_y,
+        random_state=seed
+    )
+
+    train_transforms = transforms.Compose([
+        transforms.RandomResizedCrop(227, scale=(0.85, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    eval_transforms = transforms.Compose([
+        transforms.Resize((227, 227)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+
+    dataset_train = datasets.ImageFolder(root=data_dir, transform=train_transforms)
+    dataset_eval = datasets.ImageFolder(root=data_dir, transform=eval_transforms)
+
+    train_dataset = Subset(dataset_train, train_idx)
+    val_dataset = Subset(dataset_eval, val_idx)
+    test_dataset = Subset(dataset_eval, test_idx)
+
+    return train_dataset, val_dataset, test_dataset, class_names
+
+
+def create_dataloaders(train_dataset, val_dataset, test_dataset, batch_size=32):
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=0)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
-
-    class_names = full_dataset_train.classes
-    return train_loader, val_loader, class_names
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0)
+    return train_loader, val_loader, test_loader
 
 # ==========================================
-# BLOQUE 2: Arquitectura del Modelo
+# BLOQUE 2: Extractor de Características
 # ==========================================
-def build_model(num_classes=4):
+def build_feature_extractor(device):
     """
-    Carga SqueezeNet preentrenada y modifica el clasificador final.
-    
-    Explicación de Módulos Fire en SqueezeNet:
-    - Capa Squeeze: Utiliza filtros 1x1 para comprimir la dimensión de los canales de entrada.
-      Esto reduce drásticamente la cantidad de parámetros.
-    - Capa Expand: Utiliza una combinación de filtros 1x1 y 3x3 para extraer características 
-      en múltiples escalas espaciales a partir de los canales comprimidos.
-    El resultado es un modelo altamente eficiente, logrando precisión similar a AlexNet 
-    pero con menos de 5MB de tamaño, ideal para Edge AI.
+    Carga SqueezeNet preentrenada y deja solo el extractor de características.
     """
-    # Cargar SqueezeNet versión 1.1 preentrenada con la sintaxis moderna (weights='DEFAULT')
     model = models.squeezenet1_1(weights=models.SqueezeNet1_1_Weights.DEFAULT)
-    
-    # Modificar la capa de clasificación para adaptarla a nuestras clases (Fases de Sigatoka)
-    # SqueezeNet classifier es una secuencia: [0: Dropout, 1: Conv2d, 2: ReLU, 3: AdaptiveAvgPool2d]
-    # Modificamos la capa Conv2d (índice 1) para que produzca `num_classes` canales
-    model.classifier[1] = nn.Conv2d(512, num_classes, kernel_size=(1,1), stride=(1,1))
-    
-    # Ajustar num_classes en el modelo (propiedad interna de squeezenet)
-    model.num_classes = num_classes
-    
-    return model
-
-# ==========================================
-# BLOQUE 3: Motor de Aprendizaje
-# ==========================================
-def setup_training(model):
-    """
-    Configura la función de pérdida y el optimizador.
-    """
-    # Función de pérdida para clasificación multiclase
-    criterion = nn.CrossEntropyLoss()
-    
-    # Optimizador Adam con learning rate bajo (0.0001) para captar cambios 
-    # sutiles de color (ej. diferencia entre Fase Media y Fase Final)
-    optimizer = optim.Adam(model.parameters(), lr=0.0001)
-    
-    return criterion, optimizer
-
-# ==========================================
-# BLOQUE 4: Bucle de Entrenamiento y Validación
-# ==========================================
-def train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs=10, device='cpu'):
-    """
-    Bucle de entrenamiento que incluye el cálculo de error mediante Autograd.
-    """
-    # Nota: el modelo ya debe haber sido movido al device antes de inicializar el optimizador
-    model.train() # Asegurar estado de entrenamiento inicial
-    
-    for epoch in range(num_epochs):
-        print(f'Epoch {epoch+1}/{num_epochs}')
-        print('-' * 10)
-        
-        # --- Fase de Entrenamiento ---
-        model.train()
-        running_loss = 0.0
-        running_corrects = 0.0
-        
-        for inputs, labels in train_loader:
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            
-            optimizer.zero_grad()
-            
-            # Forward pass
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            _, preds = torch.max(outputs, 1)
-            
-            # Backward pass y Autograd
-            loss.backward()
-            optimizer.step()
-            
-            running_loss += loss.item() * inputs.size(0)
-            running_corrects += torch.sum(preds == labels.data).item()
-            
-        epoch_loss = running_loss / len(train_loader.dataset)
-        epoch_acc = running_corrects / len(train_loader.dataset)
-        print(f'Train Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
-        
-        # --- Fase de Validación ---
-        model.eval()
-        val_loss = 0.0
-        val_corrects = 0.0
-        
-        with torch.no_grad():
-            for inputs, labels in val_loader:
-                inputs = inputs.to(device)
-                labels = labels.to(device)
-                
-                outputs = model(inputs)
-                loss = criterion(outputs, labels)
-                _, preds = torch.max(outputs, 1)
-                
-                val_loss += loss.item() * inputs.size(0)
-                val_corrects += torch.sum(preds == labels.data).item()
-                
-        val_epoch_loss = val_loss / len(val_loader.dataset)
-        val_epoch_acc = val_corrects / len(val_loader.dataset)
-        print(f'Val Loss: {val_epoch_loss:.4f} Acc: {val_epoch_acc:.4f}\n')
-
-    return model
-
-# ==========================================
-# BLOQUE 5: Evaluación y Matriz de Confusión
-# ==========================================
-def evaluate_and_plot_confusion_matrix(model, val_loader, class_names, device='cpu'):
-    """
-    Genera predicciones finales y grafica la matriz de confusión usando sklearn.metrics.
-    """
     model.eval()
-    all_preds = []
-    all_labels = []
-    
+    model = model.to(device)
+    return model
+
+
+def extract_features(dataloader, model, device):
+    """
+    Extrae embeddings de 512 dimensiones usando SqueezeNet + Global Average Pooling.
+    """
+    features = []
+    labels = []
+
     with torch.no_grad():
-        for inputs, labels in val_loader:
+        for inputs, targets in dataloader:
             inputs = inputs.to(device)
-            labels = labels.to(device)
-            outputs = model(inputs)
-            _, preds = torch.max(outputs, 1)
-            
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
-            
-    cm = confusion_matrix(all_labels, all_preds)
-    
-    # Graficar la matriz de confusión
-    plt.figure(figsize=(8,6))
+            outputs = model.features(inputs)
+            pooled = F.adaptive_avg_pool2d(outputs, (1, 1))
+            batch_features = pooled.view(pooled.size(0), -1).cpu().numpy()
+
+            features.append(batch_features)
+            labels.append(targets.numpy())
+
+    return np.concatenate(features, axis=0), np.concatenate(labels, axis=0)
+
+# ==========================================
+# BLOQUE 3: Entrenamiento SVM y Evaluacion
+# ==========================================
+def evaluate_split(split_name, classifier, features, labels, class_names, output_prefix):
+    preds = classifier.predict(features)
+
+    recall_macro = recall_score(labels, preds, average="macro")
+    f1_macro = f1_score(labels, preds, average="macro")
+    recall_per_class = recall_score(labels, preds, average=None)
+
+    print(f"\n[{split_name}] Recall Macro: {recall_macro:.4f}")
+    print(f"[{split_name}] F1 Macro: {f1_macro:.4f}")
+    print(f"[{split_name}] Recall por clase: {recall_per_class}")
+    print(classification_report(labels, preds, target_names=class_names, digits=4))
+
+    cm = confusion_matrix(labels, preds)
+    plt.figure(figsize=(8, 6))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names)
     plt.xlabel('Predicción')
     plt.ylabel('Verdadero')
-    plt.title('Matriz de Confusión - Detección de Sigatoka Negra')
+    plt.title(f'Matriz de Confusión - {split_name}')
     plt.tight_layout()
-    plt.savefig('confusion_matrix.png')
-    print("Matriz de confusión guardada como 'confusion_matrix.png'.")
-    print("Por favor, revise detenidamente las métricas entre 'Fase_Media' y 'Fase_Final'.")
+    plt.savefig(f'{output_prefix}_{split_name}_cm.png')
 
 # ==========================================
-# BLOQUE 6: Ejecución Principal y Exportación
+# BLOQUE 4: Ejecución Principal y Exportación
 # ==========================================
 def main():
-    # Parámetros
-    data_dir = 'dataset_sigatoka' # Cambia esto por la ruta real a tu dataset
+    data_dir = 'dataset_sigatoka'
     batch_size = 32
-    num_epochs = 15
+    val_size = 0.15
+    test_size = 0.15
+    ood_percentile = 5
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
     print(f"Usando dispositivo de cómputo: {device}")
-    
-    # 1. Setup Data
-    train_loader, val_loader, class_names = create_dataloaders(data_dir, batch_size)
-    if not train_loader:
+
+    train_dataset, val_dataset, test_dataset, class_names = create_datasets(
+        data_dir,
+        val_size=val_size,
+        test_size=test_size
+    )
+    if not train_dataset:
         return
-        
+
     print(f"Clases detectadas: {class_names}")
-    
-    # 2. Build Model y mover a dispositivo (CRÍTICO: hacer esto antes del optimizador)
-    model = build_model(num_classes=len(class_names))
-    model = model.to(device)
-    
-    # 3. Setup Engine
-    criterion, optimizer = setup_training(model)
-    
-    # 4. Train Model
-    print("Iniciando entrenamiento...")
-    trained_model = train_model(model, train_loader, val_loader, criterion, optimizer, num_epochs, device)
-    
-    # 5. Evaluate
-    print("Evaluando modelo y generando matriz de confusión...")
-    evaluate_and_plot_confusion_matrix(trained_model, val_loader, class_names, device)
-    
-    # 6. Export Model
-    save_path = 'sigatoka_squeezenet.pth'
-    torch.save(trained_model.state_dict(), save_path)
-    
-    # Verificar el tamaño del archivo para Edge AI (< 5MB)
-    file_size_mb = os.path.getsize(save_path) / (1024 * 1024)
-    print(f"\nModelo guardado en: {save_path}")
-    print(f"Tamaño del archivo: {file_size_mb:.2f} MB")
-    
-    if file_size_mb < 5.0:
-        print("¡Éxito! El peso del archivo es eficiente para dispositivos Edge AI (< 5 MB).")
-    else:
-        print("Advertencia: El tamaño del archivo supera los 5 MB.")
+
+    train_loader, val_loader, test_loader = create_dataloaders(
+        train_dataset,
+        val_dataset,
+        test_dataset,
+        batch_size=batch_size
+    )
+
+    print("Extrayendo características con SqueezeNet...")
+    extractor = build_feature_extractor(device)
+
+    X_train, y_train = extract_features(train_loader, extractor, device)
+    X_val, y_val = extract_features(val_loader, extractor, device)
+    X_test, y_test = extract_features(test_loader, extractor, device)
+
+    centroids = compute_class_centroids(X_train, y_train, len(class_names))
+    ood_threshold = compute_ood_threshold(X_val, y_val, centroids, percentile=ood_percentile)
+    print(f"Umbral OOD (percentil {ood_percentile}): {ood_threshold:.4f}")
+
+    print("Entrenando clasificador SVM (prioridad en recall)...")
+    classifier = Pipeline([
+        ("scaler", StandardScaler()),
+        ("svm", SVC(kernel="rbf", class_weight="balanced"))
+    ])
+    classifier.fit(X_train, y_train)
+
+    evaluate_split("Validacion", classifier, X_val, y_val, class_names, "sigatoka")
+    evaluate_split("Test", classifier, X_test, y_test, class_names, "sigatoka")
+
+    save_path = 'sigatoka_svm.joblib'
+    joblib.dump(
+        {
+            "model": classifier,
+            "class_names": class_names,
+            "centroids": centroids,
+            "ood_threshold": ood_threshold,
+            "ood_percentile": ood_percentile,
+        },
+        save_path
+    )
+    print(f"\nModelo SVM guardado en: {save_path}")
 
 if __name__ == '__main__':
     main()

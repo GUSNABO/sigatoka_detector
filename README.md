@@ -1,8 +1,8 @@
 # Detector de Sigatoka Negra con Deep Learning 🍌🦠
 
-Este proyecto implementa un sistema de Inteligencia Artificial basado en **PyTorch** y **Streamlit** para la detección y clasificación de la enfermedad de la **Sigatoka Negra** en hojas de banano. 
+Este proyecto implementa un sistema de Inteligencia Artificial basado en **PyTorch**, **SqueezeNet** y **SVM** para la detección y clasificación de la enfermedad de la **Sigatoka Negra** en hojas de banano. 
 
-Utiliza una arquitectura de red neuronal **SqueezeNet** pre-entrenada y modificada. Este modelo fue elegido específicamente por ser liviano y eficiente, ideal para ejecutarse en entornos con pocos recursos computacionales (Edge AI), manteniendo una alta precisión en el diagnóstico.
+La arquitectura es híbrida: **SqueezeNet** actúa como extractor de características profundas (Deep Feature Extractor) y un **SVM** realiza la clasificación final. Esta combinación conserva la eficiencia para Edge AI y prioriza la sensibilidad (Recall) por fase.
 
 ---
 
@@ -11,20 +11,20 @@ Utiliza una arquitectura de red neuronal **SqueezeNet** pre-entrenada y modifica
 El sistema está dividido en dos partes principales que cumplen roles muy distintos: el "Cerebro" que aprende y la "Interfaz" que interactúa con el usuario.
 
 ### 1. El Entrenamiento (`train_sigatoka.py`)
-Este es el motor de aprendizaje profundo del proyecto. Sus responsabilidades incluyen:
-*   **Procesamiento de Datos:** Carga las imágenes de las carpetas de entrenamiento, las recorta, ajusta sus colores (Data Augmentation) y las redimensiona al estándar requerido por la red neuronal (227x227 píxeles).
-*   **Entrenamiento:** Utiliza el modelo SqueezeNet para aprender a diferenciar las características visuales de 4 categorías distintas:
-    *   `0_Sano`
-    *   `1_Fase_Inicial`
-    *   `2_Fase_Media`
-    *   `3_Fase_Final`
-*   **Evaluación y Guardado:** Valida qué tan preciso es el modelo y, al terminar, guarda el "cerebro entrenado" en un archivo (generalmente con extensión `.pth`). Este archivo contiene todo el conocimiento adquirido por la IA.
+Este es el motor de aprendizaje híbrido del proyecto. Sus responsabilidades incluyen:
+*   **Procesamiento de Datos:** Carga las imágenes, aplica Data Augmentation suave y redimensiona al estándar requerido (227x227 píxeles).
+*   **Extracción de Características:** Usa SqueezeNet preentrenada para obtener embeddings profundos de cada imagen.
+*   **Clasificación con SVM:** Entrena un SVM con ponderación de clases para priorizar el Recall por fase.
+*   **Evaluación y Guardado:** Reporta Recall y F1 Macro, genera matrices de confusión y guarda el modelo final en `sigatoka_svm.joblib`.
 
 ### 2. La Aplicación Web (`app_sigatoka.py`)
 Esta es la interfaz gráfica, construida con la librería Streamlit. Está diseñada para ser amigable con un usuario final (como un agricultor o agrónomo). Sus tareas son:
-*   **Carga del Conocimiento:** Lee el archivo `.pth` generado en el entrenamiento para activar la red neuronal pre-entrenada.
+*   **Carga del Conocimiento:** Lee el archivo `sigatoka_svm.joblib` generado en el entrenamiento.
 *   **Interacción:** Muestra una página web donde el usuario puede cargar o arrastrar una fotografía de una hoja de banano.
-*   **Diagnóstico:** Toma esa foto subida por el usuario, la procesa rápidamente y la pasa por la Inteligencia Artificial para devolver un diagnóstico instantáneo de la fase de infección.
+*   **Diagnóstico:** Extrae características con SqueezeNet y clasifica con SVM para devolver un diagnóstico instantáneo de la fase de infección.
+
+### 3. Descarga de No_hoja (`download_no_hoja.py`)
+Script auxiliar para descargar imágenes negativas (objetos que no son hojas de banano) y crear la clase `No_hoja` de forma automática.
 
 ---
 
@@ -35,6 +35,109 @@ Antes de ejecutar cualquier script, asegúrate de tener instaladas todas las lib
 ```bash
 pip install -r requirements.txt
 ```
+
+---
+
+## 🧭 Plan de mejora paso a paso (con cantidades)
+
+### Paso 1: Crear la clase `No_hoja`
+1. Crea la carpeta `dataset_sigatoka/4_No_hoja/`.
+2. Descarga automática con icrawler:
+
+```bash
+python download_no_hoja.py --total-per-category 100
+```
+
+**Resultado esperado (exacto):** 4 categorías x 100 imágenes = **400 imágenes** en total.
+Cada categoría se distribuye entre 4 palabras clave (25 imágenes por palabra clave).
+
+Carpetas creadas:
+
+```
+dataset_sigatoka/4_No_hoja/
+	animales/ (gato, perro, vaca, caballo)
+	objetos/ (martillo, silla, telefono, bicicleta)
+	fondos/ (suelo, cielo, pared, carretera)
+	otras_plantas/ (hoja_de_mango, hoja_de_cafe, hoja_de_palma, hoja_de_papaya)
+```
+
+> Nota: revisa y elimina imágenes corruptas o irrelevantes. La calidad del dataset afecta directamente la precisión.
+
+### Paso 2: Verificar conteo
+```bash
+python - <<'PY'
+import os
+
+root = "dataset_sigatoka"
+class_counts = {}
+no_hoja_counts = {}
+
+for class_name in sorted(os.listdir(root)):
+	class_path = os.path.join(root, class_name)
+	if not os.path.isdir(class_path):
+		continue
+	count = 0
+	for dirpath, _, filenames in os.walk(class_path):
+		for name in filenames:
+			if name.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")):
+				count += 1
+	class_counts[class_name] = count
+
+	if "no" in class_name.lower():
+		sub_counts = {}
+		for sub in sorted(os.listdir(class_path)):
+			sub_path = os.path.join(class_path, sub)
+			if not os.path.isdir(sub_path):
+				continue
+			sub_count = 0
+			for dirpath, _, filenames in os.walk(sub_path):
+				for name in filenames:
+					if name.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".webp")):
+						sub_count += 1
+			sub_counts[sub] = sub_count
+		no_hoja_counts = sub_counts
+
+print("Clases y conteos:")
+for k, v in class_counts.items():
+	print(f"- {k}: {v}")
+
+if no_hoja_counts:
+	print("\nNo_hoja subcarpetas:")
+	for k, v in no_hoja_counts.items():
+		print(f"- {k}: {v}")
+PY
+```
+
+Si alguna categoria de `No_hoja` queda por debajo de 100, vuelve a ejecutar:
+
+```bash
+python download_no_hoja.py --total-per-category 7 --categories fondos otras_plantas
+```
+
+### Paso 3: Balancear las clases (cantidad exacta)
+Objetivo final: **400 imágenes por clase**.
+
+*   0_Sano: 400
+*   1_Fase_Inicial: 400
+*   2_Fase_Media: 400
+*   3_Fase_Final: 400
+*   4_No_hoja: 400
+
+Si no tienes 400 por clase, usa **300 por clase en todas** (sin excepción) para mantener el balance.
+
+### Paso 4: Reentrenar el modelo
+```bash
+python train_sigatoka.py
+```
+
+### Paso 5: Recargar el modelo en la app
+Si la app estaba abierta, haz clic en **Recargar modelo** o reinicia Streamlit para cargar el nuevo `sigatoka_svm.joblib`.
+
+### Paso 6: Probar rechazo de No_hoja
+1. Crea una carpeta de prueba con **60 imágenes** que no sean hojas de banano.
+2. Ejecuta la app y verifica que no emita diagnóstico en esas imágenes.
+
+Si aún da falsos positivos, sube el `ood_percentile` en `train_sigatoka.py` a 10, reentrena y prueba. Si persiste, sube a 15.
 
 ---
 
@@ -49,7 +152,7 @@ Lo primero que debes hacer es entrenar tu modelo de Inteligencia Artificial. Abr
 ```bash
 python train_sigatoka.py
 ```
-> **Nota:** Este proceso requiere que la IA analice cientos de imágenes. Puede tardar varios minutos u horas dependiendo del poder de procesamiento de tu computadora (si tienes tarjeta gráfica o solo procesador). Al finalizar, el script guardará automáticamente el modelo entrenado.
+> **Nota:** Este proceso requiere que la IA analice cientos de imágenes. Puede tardar varios minutos u horas dependiendo del poder de procesamiento de tu computadora. Al finalizar, el script guardará automáticamente el modelo entrenado en `sigatoka_svm.joblib`.
 
 ### Paso 2: Iniciar la Interfaz Visual (Ejecutar Después)
 
@@ -59,3 +162,23 @@ python train_sigatoka.py
 streamlit run app_sigatoka.py
 ```
 > **Resultado:** Este comando levantará un servidor local y abrirá automáticamente una pestaña en tu navegador web de internet (usualmente en la dirección `http://localhost:8501`). Allí verás el título de tu aplicación, el botón para subir imágenes y podrás probar el detector en vivo.
+
+---
+
+## ✅ Filtro anti-falsos positivos (Fuera de Dominio)
+
+Este modelo solo conoce hojas de banano. Si subes un objeto diferente (por ejemplo, un animal o un paisaje), el clasificador puede forzar una fase de Sigatoka que no corresponde. Para reducir ese error se agregó un filtro **OOD (Out-Of-Distribution)** basado en similitud de embeddings:
+
+*   Durante el entrenamiento se calcula un **centroide por clase** y un **umbral de similitud** (percentil 5 del set de validación).
+*   En la app, si la **similitud máxima** con los centroides es menor al umbral, **no se emite diagnóstico**.
+
+> **Importante:** después de actualizar el código, debes reentrenar para generar un nuevo `sigatoka_svm.joblib` con los campos `centroids` y `ood_threshold`.
+
+---
+
+## 🎯 Consejos para mejorar la precisión
+
+*   Agrega **datos negativos** (otras plantas, suelo, frutos, animales) o crea una clase explícita `No_hoja`.
+*   Aumenta la diversidad de iluminación, ángulos y distancias en el dataset.
+*   Balancea las clases para evitar sesgos hacia una fase específica.
+*   Ajusta el `ood_percentile` en `train_sigatoka.py`: un valor más alto hace el filtro más estricto (menos falsos positivos), pero puede rechazar hojas válidas.
