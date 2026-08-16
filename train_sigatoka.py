@@ -41,6 +41,25 @@ def compute_ood_threshold(val_features, val_labels, centroids, percentile=5):
     similarities = np.sum(feats_norm * true_centroids, axis=1)
     return float(np.percentile(similarities, percentile))
 
+
+def compute_class_similarity_thresholds(val_features, val_labels, centroids, class_names, percentile=5):
+    if val_features.size == 0:
+        return {}
+
+    feats_norm = l2_normalize(val_features, axis=1)
+    cent_norm = l2_normalize(centroids, axis=1)
+    thresholds = {}
+
+    for idx, name in enumerate(class_names):
+        mask = val_labels == idx
+        if not np.any(mask):
+            thresholds[name] = 0.0
+            continue
+        sims = np.sum(feats_norm[mask] * cent_norm[idx], axis=1)
+        thresholds[name] = float(np.percentile(sims, percentile))
+
+    return thresholds
+
 # ==========================================
 # BLOQUE 1: Configuración y Preprocesamiento
 # ==========================================
@@ -200,6 +219,13 @@ def main():
 
     centroids = compute_class_centroids(X_train, y_train, len(class_names))
     ood_threshold = compute_ood_threshold(X_val, y_val, centroids, percentile=ood_percentile)
+    class_sim_thresholds = compute_class_similarity_thresholds(
+        X_val,
+        y_val,
+        centroids,
+        class_names,
+        percentile=ood_percentile
+    )
     print(f"Umbral OOD (percentil {ood_percentile}): {ood_threshold:.4f}")
 
     print("Entrenando clasificador SVM (prioridad en recall)...")
@@ -220,6 +246,7 @@ def main():
             "centroids": centroids,
             "ood_threshold": ood_threshold,
             "ood_percentile": ood_percentile,
+            "class_sim_thresholds": class_sim_thresholds,
         },
         save_path
     )
