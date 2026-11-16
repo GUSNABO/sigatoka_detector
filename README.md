@@ -38,6 +38,70 @@ pip install -r requirements.txt
 
 ---
 
+## 🔄 Flujo de SqueezeNet + SVM en orden
+
+El proyecto no entrena una red completa para clasificar directamente. La arquitectura es híbrida y trabaja en dos etapas:
+
+1. **SqueezeNet como extractor de características**
+   - En `train_sigatoka.py`, dentro de `build_feature_extractor()`, se carga una SqueezeNet preentrenada:
+   ```python
+   model = models.squeezenet1_1(weights=models.SqueezeNet1_1_Weights.DEFAULT)
+   ```
+   - Esta red no decide la clase final. Su trabajo es analizar la imagen y producir un vector de características (embeddings) de baja dimensión.
+   - En `extract_features()`, cada imagen pasa por `model.features(inputs)` y luego se aplica `adaptive_avg_pool2d` para convertir la salida en un vector compacto.
+
+2. **SVM como clasificador final**
+   - Una vez que SqueezeNet genera los embeddings, se entrena el clasificador:
+   ```python
+   classifier = Pipeline([
+       ("scaler", StandardScaler()),
+       ("svm", SVC(kernel="rbf", class_weight="balanced"))
+   ])
+   classifier.fit(X_train, y_train)
+   ```
+   - El SVM recibe los vectores de características y aprende a separar las clases: sano, fase inicial, fase media, fase final y no hoja.
+
+### Orden real de ejecución
+
+El flujo del entrenamiento es:
+
+```text
+Imágenes del dataset
+        ↓
+SqueezeNet extrae embeddings
+        ↓
+StandardScaler normaliza los embeddings
+        ↓
+SVM entrena con esos vectores
+        ↓
+Se evalúa en validación y prueba
+        ↓
+Se guarda el modelo final en sigatoka_svm.joblib
+```
+
+### ¿Qué hace cada componente?
+
+- **SqueezeNet:** detecta patrones visuales complejos (textura, manchas, color, forma) y los resume en un vector representativo.
+- **SVM:** toma ese vector y define el límite de decisión entre las clases.
+
+### En la app
+
+Cuando se usa la aplicación web (`app_sigatoka.py`), el flujo es el mismo pero en inferencia:
+
+```text
+Imagen subida por el usuario
+        ↓
+SqueezeNet extrae features
+        ↓
+SVM predice la clase
+        ↓
+Se muestra el diagnóstico final
+```
+
+Esto hace que el sistema sea más eficiente que entrenar una red completa desde cero, y además conserva la capacidad de usar un clasificador robusto sobre descriptores profundos.
+
+---
+
 ## 🧭 Plan de mejora paso a paso (con cantidades)
 
 ### Paso 1: Crear la clase `No_hoja`
@@ -63,7 +127,22 @@ dataset_sigatoka/4_No_hoja/
 
 > Nota: revisa y elimina imágenes corruptas o irrelevantes. La calidad del dataset afecta directamente la precisión.
 
-### Paso 2: Verificar conteo
+### Paso 2: Limpieza de dataset (corruptos y duplicados)
+Primero revisa sin modificar archivos:
+
+```bash
+python clean_dataset.py --root dataset_sigatoka
+```
+
+Si quieres aplicar cambios, usa cuarentena (recomendado):
+
+```bash
+python clean_dataset.py --root dataset_sigatoka --action quarantine
+```
+
+Los archivos se moverán a `dataset_sigatoka/_quarantine`.
+
+### Paso 3: Verificar conteo
 ```bash
 python - <<'PY'
 import os
@@ -114,7 +193,7 @@ Si alguna categoria de `No_hoja` queda por debajo de 100, vuelve a ejecutar:
 python download_no_hoja.py --total-per-category 7 --categories fondos otras_plantas
 ```
 
-### Paso 3: Balancear las clases (cantidad exacta)
+### Paso 4: Balancear las clases (cantidad exacta)
 Objetivo final: **400 imágenes por clase**.
 
 *   0_Sano: 400
@@ -125,15 +204,27 @@ Objetivo final: **400 imágenes por clase**.
 
 Si no tienes 400 por clase, usa **300 por clase en todas** (sin excepción) para mantener el balance.
 
-### Paso 4: Reentrenar el modelo
+Para aplicar el balanceo automatico (mueve sobrantes a respaldo):
+
+```bash
+python balance_dataset.py --root dataset_sigatoka --target 300 --action apply
+```
+
+### Paso 5: Reentrenar el modelo
 ```bash
 python train_sigatoka.py
 ```
 
-### Paso 5: Recargar el modelo en la app
+### Paso 6: Recargar el modelo en la app
 Si la app estaba abierta, haz clic en **Recargar modelo** o reinicia Streamlit para cargar el nuevo `sigatoka_svm.joblib`.
 
-### Paso 6: Probar rechazo de No_hoja
+### Paso 7: Evaluar negativos (No_hoja)
+Para una evaluacion rapida:
+
+```bash
+python evaluate_no_hoja.py --neg-dir dataset_sigatoka/4_No_hoja
+```
+
 1. Crea una carpeta de prueba con **60 imágenes** que no sean hojas de banano.
 2. Ejecuta la app y verifica que no emita diagnóstico en esas imágenes.
 
@@ -170,7 +261,8 @@ streamlit run app_sigatoka.py
 Este modelo solo conoce hojas de banano. Si subes un objeto diferente (por ejemplo, un animal o un paisaje), el clasificador puede forzar una fase de Sigatoka que no corresponde. Para reducir ese error se agregó un filtro **OOD (Out-Of-Distribution)** basado en similitud de embeddings:
 
 *   Durante el entrenamiento se calcula un **centroide por clase** y un **umbral de similitud** (percentil 5 del set de validación).
-*   En la app, si la **similitud máxima** con los centroides es menor al umbral, **no se emite diagnóstico**.
+*   En la app, si la **similitud máxima** con los centroides es menor al umbral, se muestra una **advertencia de baja confianza**.
+*   Si el modelo predice `No_hoja`, se verifica un **umbral por clase**. Si es bajo, se reporta la mejor fase con baja confianza; si es alto, **no se emite diagnóstico**.
 
 > **Importante:** después de actualizar el código, debes reentrenar para generar un nuevo `sigatoka_svm.joblib` con los campos `centroids` y `ood_threshold`.
 

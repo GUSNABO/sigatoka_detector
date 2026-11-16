@@ -1,4 +1,13 @@
 venv/
+.venv/
 __pycache__/
+*.pyc
+*.pyo
 *.pth
+*.joblib
+*.png
+sigatoka_*.png
 confusion_matrix.png
+dataset_sigatoka/
+dataset_sigatoka/_balance_backup/
+.vscode/

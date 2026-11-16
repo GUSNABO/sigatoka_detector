@@ -68,6 +68,7 @@ def compute_ood_threshold(val_features, val_labels, centroids, percentile=5, exc
     return float(np.percentile(similarities, percentile))
 
 
+<<<<<<< HEAD
 def predict_with_ood(classifier, features, centroids, ood_threshold, ood_class_idx=OOD_CLASS_IDX):
     """
     Compuerta OOD:
@@ -87,6 +88,25 @@ def predict_with_ood(classifier, features, centroids, ood_threshold, ood_class_i
         preds[in_domain_mask] = classifier.predict(features[in_domain_mask])
 
     return preds, max_sim, in_domain_mask
+=======
+def compute_class_similarity_thresholds(val_features, val_labels, centroids, class_names, percentile=5):
+    if val_features.size == 0:
+        return {}
+
+    feats_norm = l2_normalize(val_features, axis=1)
+    cent_norm = l2_normalize(centroids, axis=1)
+    thresholds = {}
+
+    for idx, name in enumerate(class_names):
+        mask = val_labels == idx
+        if not np.any(mask):
+            thresholds[name] = 0.0
+            continue
+        sims = np.sum(feats_norm[mask] * cent_norm[idx], axis=1)
+        thresholds[name] = float(np.percentile(sims, percentile))
+
+    return thresholds
+>>>>>>> 2bc414e43081846122e4e23473ba22c7d4a3d229
 
 # ==========================================
 # BLOQUE 1: Configuración y Preprocesamiento
@@ -355,6 +375,13 @@ def main():
 
     centroids = compute_class_centroids(X_train, y_train, len(class_names))
     ood_threshold = compute_ood_threshold(X_val, y_val, centroids, percentile=ood_percentile)
+    class_sim_thresholds = compute_class_similarity_thresholds(
+        X_val,
+        y_val,
+        centroids,
+        class_names,
+        percentile=ood_percentile
+    )
     print(f"Umbral OOD (percentil {ood_percentile}): {ood_threshold:.4f}")
 
     print("Entrenando clasificador SVM (prioridad en recall)...")
@@ -376,7 +403,11 @@ def main():
             "centroids": centroids,
             "ood_threshold": ood_threshold,
             "ood_percentile": ood_percentile,
+<<<<<<< HEAD
             "ood_class_idx": OOD_CLASS_IDX,
+=======
+            "class_sim_thresholds": class_sim_thresholds,
+>>>>>>> 2bc414e43081846122e4e23473ba22c7d4a3d229
         },
         save_path
     )

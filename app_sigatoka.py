@@ -7,6 +7,8 @@ from PIL import Image
 import joblib
 import numpy as np
 
+NO_HOJA_MARGIN = 0.02
+
 # ==========================================
 # BLOQUE 1: Configuración de la Página
 # ==========================================
@@ -39,6 +41,7 @@ def cargar_modelo_hibrido():
     class_names = artifact.get("class_names")
     centroids = artifact.get("centroids")
     ood_threshold = artifact.get("ood_threshold")
+    class_sim_thresholds = artifact.get("class_sim_thresholds") or {}
 
     if classifier is None or class_names is None:
         st.error("Error: El archivo joblib no contiene 'model' o 'class_names'.")
@@ -49,7 +52,7 @@ def cargar_modelo_hibrido():
     extractor.eval()
     extractor = extractor.to(device)
 
-    return classifier, class_names, extractor, device, centroids, ood_threshold
+    return classifier, class_names, extractor, device, centroids, ood_threshold, class_sim_thresholds
 
 # ==========================================
 # BLOQUE 3: Preprocesamiento de la Imagen
@@ -80,18 +83,28 @@ def extraer_features(img_t, extractor, device):
     return features
 
 
-def detectar_ood(features, centroids, threshold):
-    if centroids is None or threshold is None:
-        return False, None
+def calcular_similitudes(features, centroids):
+    if centroids is None:
+        return None
 
     features = np.asarray(features, dtype=np.float32)
     centroids = np.asarray(centroids, dtype=np.float32)
     feat_norm = features / (np.linalg.norm(features, axis=1, keepdims=True) + 1e-12)
     cent_norm = centroids / (np.linalg.norm(centroids, axis=1, keepdims=True) + 1e-12)
     similarities = np.dot(feat_norm, cent_norm.T)
-    max_sim = float(np.max(similarities))
+    return similarities[0]
 
-    return max_sim < threshold, max_sim
+
+def detectar_ood(features, centroids, threshold):
+    if centroids is None or threshold is None:
+        return False, None, None
+
+    similarities = calcular_similitudes(features, centroids)
+    if similarities is None:
+        return False, None, None
+
+    max_sim = float(np.max(similarities))
+    return max_sim < threshold, max_sim, similarities
 
 
 def es_no_hoja_label(label):
@@ -101,6 +114,23 @@ def es_no_hoja_label(label):
     normalized = " ".join(normalized.split())
     return "no hoja" in normalized
 
+
+def mejor_sigatoka(similarities, class_names):
+    if similarities is None:
+        return None, None
+
+    indices = [
+        idx for idx, name in enumerate(class_names)
+        if not es_no_hoja_label(name)
+    ]
+    if not indices:
+        return None, None
+
+    sig_sims = similarities[indices]
+    best_pos = int(np.argmax(sig_sims))
+    best_idx = indices[best_pos]
+    return best_idx, float(sig_sims[best_pos])
+
 # ==========================================
 # BLOQUE 4: Interfaz de Usuario Principal
 # ==========================================
@@ -108,11 +138,13 @@ def es_no_hoja_label(label):
 model_bundle = cargar_modelo_hibrido()
 
 if model_bundle is not None:
-    classifier, class_names, extractor, device, centroids, ood_threshold = model_bundle
+    classifier, class_names, extractor, device, centroids, ood_threshold, class_sim_thresholds = model_bundle
     if centroids is None or ood_threshold is None:
         st.warning("El modelo no incluye el filtro OOD. Reentrena con la ultima version de train_sigatoka.py.")
     if not any(es_no_hoja_label(name) for name in class_names):
         st.warning("El modelo no tiene la clase No_hoja. Reentrena incluyendo esa carpeta.")
+    if not class_sim_thresholds:
+        st.warning("El modelo no incluye umbrales por clase. Reentrena con la ultima version de train_sigatoka.py.")
     # Widget de Streamlit que permite al usuario cargar imágenes
     archivo_subido = st.file_uploader("Elige una imagen de la hoja...", type=["jpg", "jpeg", "png"])
 
@@ -127,35 +159,74 @@ if model_bundle is not None:
             # 1. Preparar la imagen (el mismo proceso de la tesis)
             img_t = preprocesar_imagen(imagen)
             
-            # 2. Evaluar si la imagen es OOD (fuera del dominio de hojas de banano)
+            # 2. Extraer caracteristicas y evaluar OOD
             features = extraer_features(img_t, extractor, device)
-            es_ood, _max_sim = detectar_ood(features, centroids, ood_threshold)
+            es_ood, max_sim, similarities = detectar_ood(features, centroids, ood_threshold)
 
-            if es_ood:
-                st.error("La imagen parece estar fuera del dominio de hojas de banano. No se emite un diagnóstico.")
-                st.info("Prueba con una foto centrada en una hoja de banano, con buena iluminación y sin fondo dominante.")
-            else:
-                # 3. Ejecutar la predicción
-                prediccion = classifier.predict(features)[0]
+            # 3. Ejecutar la prediccion
+            prediccion = classifier.predict(features)[0]
 
-                # 4. Mostrar resultado basado en las carpetas originales
-                resultado = class_names[int(prediccion)]
+            # 4. Mostrar resultado basado en las carpetas originales
+            resultado = class_names[int(prediccion)]
 
-                if es_no_hoja_label(resultado):
-                    st.warning("La imagen no corresponde a una hoja de banano. No se emite un diagnóstico.")
+            override_no_hoja = False
+            if es_no_hoja_label(resultado):
+                no_hoja_threshold = class_sim_thresholds.get(resultado)
+                no_hoja_idx = class_names.index(resultado) if resultado in class_names else None
+                no_hoja_sim = similarities[no_hoja_idx] if (similarities is not None and no_hoja_idx is not None) else None
+                best_sig_idx, best_sig_sim = mejor_sigatoka(similarities, class_names)
+                sig_thresh = None
+
+                if best_sig_idx is not None:
+                    sig_thresh = class_sim_thresholds.get(class_names[best_sig_idx], ood_threshold)
+                if sig_thresh is None:
+                    sig_thresh = 0.0
+
+                threshold_override = (
+                    no_hoja_threshold is not None
+                    and no_hoja_sim is not None
+                    and no_hoja_sim < no_hoja_threshold
+                )
+                margin_override = (
+                    no_hoja_sim is not None
+                    and best_sig_sim is not None
+                    and (best_sig_sim + NO_HOJA_MARGIN >= no_hoja_sim)
+                )
+
+                if (
+                    best_sig_idx is not None
+                    and best_sig_sim is not None
+                    and best_sig_sim >= sig_thresh
+                    and (threshold_override or margin_override)
+                ):
+                    resultado = class_names[best_sig_idx]
+                    override_no_hoja = True
                 else:
-                    # Muestra un recuadro verde con el diagnóstico final
-                    st.success(f"Diagnóstico de la IA: **{resultado}**")
+                    st.warning("La imagen no corresponde a una hoja de banano. No se emite un diagnóstico.")
+                    st.info("Prueba con una foto centrada en una hoja de banano, con buena iluminación y sin fondo dominante.")
 
-                    # ==========================================
-                    # BLOQUE 5: Explicación Científica (Sustentación)
-                    # ==========================================
-                    st.markdown("### Explicación del Ensamblador")
-                    if "Sano" in resultado:
-                        st.info("El modelo detecta una superficie foliar homogénea, sin presencia de estrías cloróticas ni evidencia de necrosis.")
-                    elif "Inicial" in resultado:
-                        st.warning("El **Ensamblador** identificó posibles estrías o manchas pálidas sutiles, indicativas de la Fase Inicial de la infección.")
-                    elif "Media" in resultado:
-                        st.error("El **Ensamblador** detectó textura seca (1x1) y bordes irregulares (3x3) típicos de la necrosis marrón característica de la Fase Media.")
-                    elif "Final" in resultado:
-                        st.error("El **Ensamblador** ha identificado un colapso foliar masivo y manchas necróticas oscuras fusionadas, propias del estado terminal o Fase Final.")
+            if not es_no_hoja_label(resultado):
+                # Muestra un recuadro verde con el diagnóstico final
+                st.success(f"Diagnóstico de la IA: **{resultado}**")
+
+                if override_no_hoja:
+                    st.warning("Baja confianza: la imagen se parece poco a la clase No_hoja. Se reporta la mejor fase.")
+
+                if es_ood:
+                    st.warning(
+                        "Baja confianza: la imagen se aleja del dominio de entrenamiento. "
+                        "Se recomienda repetir la foto con mejor iluminación y enfoque."
+                    )
+
+                # ==========================================
+                # BLOQUE 5: Explicación Científica (Sustentación)
+                # ==========================================
+                st.markdown("### Explicación del Ensamblador")
+                if "Sano" in resultado:
+                    st.info("El modelo detecta una superficie foliar homogénea, sin presencia de estrías cloróticas ni evidencia de necrosis.")
+                elif "Inicial" in resultado:
+                    st.warning("El **Ensamblador** identificó posibles estrías o manchas pálidas sutiles, indicativas de la Fase Inicial de la infección.")
+                elif "Media" in resultado:
+                    st.error("El **Ensamblador** detectó textura seca (1x1) y bordes irregulares (3x3) típicos de la necrosis marrón característica de la Fase Media.")
+                elif "Final" in resultado:
+                    st.error("El **Ensamblador** ha identificado un colapso foliar masivo y manchas necróticas oscuras fusionadas, propias del estado terminal o Fase Final.")
