@@ -31,15 +31,13 @@ def l2_normalize(arr, axis=1, eps=1e-12):
     return arr / (norm + eps)
 
 
-def compute_class_centroids(features, labels, num_classes, exclude_class=OOD_CLASS_IDX):
+def compute_class_centroids(features, labels, num_classes):
     """
-    Calcula centroides normalizados L2 para las clases pertenecientes al dominio (hojas).
+    Calcula centroides normalizados L2 para cada clase.
     """
     feats_norm = l2_normalize(features, axis=1)
     centroids = []
     for cls in range(num_classes):
-        if cls == exclude_class:
-            continue
         cls_features = feats_norm[labels == cls]
         if cls_features.size == 0:
             centroids.append(np.zeros(features.shape[1], dtype=np.float32))
@@ -50,7 +48,7 @@ def compute_class_centroids(features, labels, num_classes, exclude_class=OOD_CLA
 
 def compute_ood_threshold(val_features, val_labels, centroids, percentile=5, exclude_class=OOD_CLASS_IDX):
     """
-    Calcula el umbral de similitud coseno usando únicamente muestras válidas del dominio.
+    Calcula el umbral de similitud coseno usando únicamente muestras válidas del dominio (hojas).
     """
     if val_features.size == 0:
         return 0.0
@@ -68,27 +66,6 @@ def compute_ood_threshold(val_features, val_labels, centroids, percentile=5, exc
     return float(np.percentile(similarities, percentile))
 
 
-<<<<<<< HEAD
-def predict_with_ood(classifier, features, centroids, ood_threshold, ood_class_idx=OOD_CLASS_IDX):
-    """
-    Compuerta OOD:
-    1. Calcula la máxima similitud coseno de cada vector 512D contra los centroides de hoja.
-    2. Si max_sim < ood_threshold -> Rechaza la imagen como Clase 4 (No Hoja) sin pasar por la SVM.
-    3. Solo las muestras dentro del dominio son clasificadas por la SVM.
-    """
-    feats_norm = l2_normalize(features, axis=1)
-    cent_norm = l2_normalize(centroids, axis=1)
-
-    sim_matrix = np.dot(feats_norm, cent_norm.T)
-    max_sim = np.max(sim_matrix, axis=1)
-
-    preds = np.full(features.shape[0], ood_class_idx, dtype=np.int64)
-    in_domain_mask = max_sim >= ood_threshold
-    if np.any(in_domain_mask):
-        preds[in_domain_mask] = classifier.predict(features[in_domain_mask])
-
-    return preds, max_sim, in_domain_mask
-=======
 def compute_class_similarity_thresholds(val_features, val_labels, centroids, class_names, percentile=5):
     if val_features.size == 0:
         return {}
@@ -106,7 +83,28 @@ def compute_class_similarity_thresholds(val_features, val_labels, centroids, cla
         thresholds[name] = float(np.percentile(sims, percentile))
 
     return thresholds
->>>>>>> 2bc414e43081846122e4e23473ba22c7d4a3d229
+
+
+def predict_with_ood(classifier, features, centroids, ood_threshold, ood_class_idx=OOD_CLASS_IDX):
+    """
+    Compuerta OOD:
+    1. Calcula la máxima similitud coseno de cada vector 512D contra los centroides de hoja.
+    2. Si max_sim < ood_threshold -> Rechaza la imagen como Clase 4 (No Hoja) sin pasar por la SVM.
+    3. Solo las muestras dentro del dominio son clasificadas por la SVM.
+    """
+    feats_norm = l2_normalize(features, axis=1)
+    leaf_centroids = centroids[:ood_class_idx] if centroids.shape[0] > ood_class_idx else centroids
+    cent_norm = l2_normalize(leaf_centroids, axis=1)
+
+    sim_matrix = np.dot(feats_norm, cent_norm.T)
+    max_sim = np.max(sim_matrix, axis=1)
+
+    preds = np.full(features.shape[0], ood_class_idx, dtype=np.int64)
+    in_domain_mask = max_sim >= ood_threshold
+    if np.any(in_domain_mask):
+        preds[in_domain_mask] = classifier.predict(features[in_domain_mask])
+
+    return preds, max_sim, in_domain_mask
 
 # ==========================================
 # BLOQUE 1: Configuración y Preprocesamiento
@@ -385,12 +383,11 @@ def main():
     print(f"Umbral OOD (percentil {ood_percentile}): {ood_threshold:.4f}")
 
     print("Entrenando clasificador SVM (prioridad en recall)...")
-    in_domain_train = y_train != OOD_CLASS_IDX
     classifier = Pipeline([
         ("scaler", StandardScaler()),
         ("svm", SVC(kernel="rbf", class_weight="balanced"))
     ])
-    classifier.fit(X_train[in_domain_train], y_train[in_domain_train])
+    classifier.fit(X_train, y_train)
 
     evaluate_split("Validacion", classifier, X_val, y_val, class_names, "sigatoka", centroids, ood_threshold)
     evaluate_split("Test", classifier, X_test, y_test, class_names, "sigatoka", centroids, ood_threshold)
@@ -403,11 +400,8 @@ def main():
             "centroids": centroids,
             "ood_threshold": ood_threshold,
             "ood_percentile": ood_percentile,
-<<<<<<< HEAD
             "ood_class_idx": OOD_CLASS_IDX,
-=======
             "class_sim_thresholds": class_sim_thresholds,
->>>>>>> 2bc414e43081846122e4e23473ba22c7d4a3d229
         },
         save_path
     )
