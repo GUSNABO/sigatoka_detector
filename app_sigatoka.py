@@ -13,7 +13,7 @@ import numpy as np
 # Esta configuración define el título en la pestaña del navegador y el icono
 st.set_page_config(page_title="Detector de Sigatoka Negra", page_icon="🍌", layout="centered")
 
-st.title("🍌 IA para Detección de Sigatoka Negra")
+st.title("Detección de Sigatoka Negra")
 st.write("Sube una imagen de una hoja de banano para que el **Ensamblador** analice su textura y forma.")
 
 if st.button("Recargar modelo"):
